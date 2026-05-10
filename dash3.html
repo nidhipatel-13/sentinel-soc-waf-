@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Sentinel SOC v4.3 MASTER</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #0b0e14; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; overflow-x: hidden; }
+        .card { background-color: #161b22; border: 1px solid #30363d; margin-bottom: 20px; }
+        .metric-value { font-size: 2.2rem; font-weight: bold; color: #ffffff !important; }
+        .card h6 { color: #8b949e !important; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 1px; }
+        .sev-high { border-left: 4px solid #f85149; }
+        .sev-med { border-left: 4px solid #d29922; }
+        .sev-low { border-left: 4px solid #3fb950; }
+        .nav-tabs .nav-link { color: #8b949e; border: none; cursor: pointer; }
+        .nav-tabs .nav-link.active { background: #1f6feb !important; color: white; border-radius: 4px; }
+        .payload-box { max-width: 400px; max-height: 80px; overflow: auto; word-break: break-all; background: #0d1117; padding: 8px; border-radius: 6px; border: 1px solid #30363d; font-family: monospace; font-size: 0.75rem; }
+    </style>
+</head>
+<body class="p-4">
+    <div class="container-fluid">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <div>
+                <h2 class="mb-0">🛡️ Sentinel <span class="text-primary">v4.3 SOC</span></h2>
+                <p class="text-muted small">Real-time Bi-Directional Scaling | XSS Shielded</p>
+            </div>
+            <div id="sync-indicator" class="badge bg-success">DATABASE CONNECTED</div>
+        </div>
+
+        <div class="row text-center">
+            <div class="col-md-2"><div class="card p-3"><h6>Total IPs</h6><div id="m-access" class="metric-value">0</div></div></div>
+            <div class="col-md-2"><div class="card p-3"><h6>Threat Actors</h6><div id="m-attack-ips" class="metric-value">0</div></div></div>
+            <div class="col-md-2"><div class="card p-3"><h6>Legit (200)</h6><div id="m-200" class="metric-value">0</div></div></div>
+            <div class="col-md-2"><div class="card p-3"><h6>Blocked (403)</h6><div id="m-403" class="metric-value">0</div></div></div>
+            <div class="col-md-2"><div class="card p-3"><h6>Rate Limits</h6><div id="m-429" class="metric-value">0</div></div></div>
+            <div class="col-md-2"><div class="card p-3"><h6>Active Bans</h6><div id="m-bans" class="metric-value">0</div></div></div>
+        </div>
+
+        <ul class="nav nav-tabs my-4" id="socTabs">
+            <li class="nav-item"><button class="nav-link active" onclick="showTab('overview')">Traffic Overview</button></li>
+            <li class="nav-item"><button class="nav-link" onclick="showTab('forensics')">DPI Forensics</button></li>
+            <li class="nav-item"><button class="nav-link" onclick="showTab('intel')">Endpoint Intel</button></li>
+        </ul>
+
+        <div id="tab-overview" class="tab-content"><div class="card p-4" style="height:400px;"><canvas id="trafficChart"></canvas></div></div>
+        <div id="tab-forensics" class="tab-content d-none"><div class="card p-3"><table class="table table-dark table-hover small"><thead><tr><th>Time</th><th>Source IP</th><th>Attack Type</th><th>Payload</th><th>Action</th></tr></thead><tbody id="log-table"></tbody></table></div></div>
+        <div id="tab-intel" class="tab-content d-none">
+            <div class="row"><div class="col-md-6"><div class="card p-4" style="height:350px;"><h6>OS Distribution</h6><canvas id="osChart"></canvas></div></div><div class="col-md-6"><div class="card p-4" style="height:350px;"><h6>Browser Analysis</h6><canvas id="brChart"></canvas></div></div></div>
+            <div class="card p-3 mt-3"><h6>Current Blacklist</h6><ul id="ban-list" class="text-danger small"></ul></div>
+        </div>
+    </div>
+
+    <script>
+        let tChart, osChart, brChart;
+        let lastHistoryHash = "";
+        const safeSet = (id, val) => { const el = document.getElementById(id); if(el) el.innerText = val; };
+        const sanitize = (str) => { const p = document.createElement('p'); p.textContent = str; return p.innerHTML; };
+
+        function initIntelCharts() {
+            if (osChart) return;
+            const cfg = { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { labels: { color: '#8b949e' } } } };
+            osChart = new Chart(document.getElementById('osChart'), { type: 'doughnut', data: { labels: [], datasets: [{ data: [], backgroundColor: ['#1f6feb', '#3fb950', '#f85149', '#d29922'] }] }, options: cfg });
+            brChart = new Chart(document.getElementById('brChart'), { type: 'pie', data: { labels: [], datasets: [{ data: [], backgroundColor: ['#db6d28', '#1f6feb', '#3fb950', '#f85149'] }] }, options: cfg });
+        }
+
+        function showTab(id) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('d-none'));
+            document.getElementById('tab-' + id).classList.remove('d-none');
+            document.querySelectorAll('.nav-link').forEach(el => el.classList.toggle('active', el.innerText.toLowerCase().includes(id.substring(0,3))));
+            
+            // BI-DIRECTIONAL RESIZE FIX
+            if (id === 'intel') { initIntelCharts(); setTimeout(() => { osChart.resize(); brChart.resize(); }, 50); }
+            if (id === 'overview' && tChart) { setTimeout(() => tChart.resize(), 50); }
+        }
+
+        async function updateDashboard() {
+            try {
+                const res = await fetch('/api/stats');
+                if (!res.ok) throw new Error("API Offline");
+                const data = await res.json();
+                
+                const sync = document.getElementById('sync-indicator');
+                sync.innerText = "DATABASE CONNECTED"; sync.className = "badge bg-success";
+
+                safeSet('m-access', data.counts.access_ip);
+                safeSet('m-attack-ips', data.counts.attack_ip);
+                safeSet('m-200', data.metrics["200"]);
+                safeSet('m-403', data.metrics["403"]);
+                safeSet('m-429', data.metrics["429"]);
+                safeSet('m-bans', data.counts.active_bans);
+
+                const hHash = JSON.stringify(data.history);
+                if (hHash !== lastHistoryHash) {
+                    tChart.data.labels = data.history.map(h => h.t);
+                    tChart.data.datasets[0].data = data.history.map(h => h.total);
+                    tChart.data.datasets[1].data = data.history.map(h => h.attacks);
+                    tChart.update('none'); lastHistoryHash = hHash;
+                }
+
+                if (osChart) {
+                    osChart.data.labels = Object.keys(data.intel.os); osChart.data.datasets[0].data = Object.values(data.intel.os); osChart.update('none');
+                    brChart.data.labels = Object.keys(data.intel.browsers); brChart.data.datasets[0].data = Object.values(data.intel.browsers); brChart.update('none');
+                }
+
+                document.getElementById('ban-list').innerHTML = data.intel.active_bans.map(ip => `<li>🛡️ ${sanitize(ip)}</li>`).join('') || "<li>No Active Bans</li>";
+                document.getElementById('log-table').innerHTML = data.logs.map(l => {
+                    const sev = l.attack.includes('HIGH') ? 'sev-high' : l.attack.includes('MED') ? 'sev-med' : 'sev-low';
+                    return `<tr class="${sev}"><td>${l.ts}</td><td class="fw-bold">${sanitize(l.ip)}</td><td><span class="badge bg-secondary">${sanitize(l.attack)}</span></td><td><div class="payload-box">${sanitize(l.payload)}</div></td><td><span class="text-danger">DROP</span></td></tr>`;
+                }).join('');
+            } catch (e) { 
+                const sync = document.getElementById('sync-indicator');
+                sync.innerText = "SYNC LOST"; sync.className = "badge bg-danger";
+            }
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            tChart = new Chart(document.getElementById('trafficChart'), { type: 'line', data: { labels: [], datasets: [{ label: 'Total Volume', data: [], borderColor: '#1f6feb', fill: true, backgroundColor: 'rgba(31,111,235,0.1)' }, { label: 'Attacks', data: [], borderColor: '#f85149' }] }, options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true, grid: { color: '#30363d' } }, x: { grid: { display: false } } } } });
+            updateDashboard(); setInterval(updateDashboard, 2000);
+        });
+    </script>
+</body>
+</html>
